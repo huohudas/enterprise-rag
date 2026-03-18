@@ -1,20 +1,20 @@
 """
 RAGAS评测脚本 - 适配 ragas 0.4.3
+只评测 Faithfulness 和 ContextRecall 两个核心指标
 """
 
 import os
 import sys
+import json
 sys.path.insert(0, '/workspaces/enterprise-rag')
 
 from dotenv import load_dotenv
 load_dotenv('/workspaces/enterprise-rag/.env')
 
+from openai import AsyncOpenAI
 from ragas import EvaluationDataset, evaluate
 from ragas.llms import llm_factory
-from ragas.metrics.collections import Faithfulness, AnswerRelevancy, ContextRecall
-from openai import OpenAI
-from langchain_openai import ChatOpenAI
-from langchain_huggingface import HuggingFaceEmbeddings
+from ragas.metrics import Faithfulness, ContextRecall
 
 from config import DEFAULT_CONFIG
 from rag_modules import (
@@ -78,10 +78,6 @@ def collect_rag_outputs(data_module, retrieval_module, generation_module):
         print(f"  处理问题 {i+1}/{len(TEST_CASES)}: {question}")
         chunks = retrieval_module.hybrid_search(question, top_k=3)
         parent_docs = data_module.get_parent_documents(chunks)
-        generation_module_inst = GenerationModule(
-            model_name=DEFAULT_CONFIG.llm_model,
-            temperature=DEFAULT_CONFIG.temperature
-        )
         answer = generation_module.generate_answer(question, parent_docs)
         contexts = [doc.page_content[:500] for doc in parent_docs]
         results.append({
@@ -97,32 +93,18 @@ def run_evaluation(results):
     print("\n正在运行RAGAS评测...")
 
     api_key = os.getenv("ZHIPU_API_KEY")
-
-    # 使用新版llm_factory，通过OpenAI兼容接口接入智谱
-    openai_client = OpenAI(
+    client = AsyncOpenAI(
         api_key=api_key,
         base_url="https://open.bigmodel.cn/api/paas/v4/"
     )
-    eval_llm = llm_factory(
-        model="glm-4-flash",
-        client=openai_client
-    )
+    eval_llm = llm_factory("glm-4-flash", client=client)
 
-    # 嵌入模型使用RAGAS内置的HuggingFace支持
-    from ragas.embeddings import HuggingFaceEmbeddings
-    eval_embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-small-zh-v1.5"
-    )
+    faithfulness = Faithfulness()
+    context_recall = ContextRecall()
 
     dataset = EvaluationDataset.from_list(results)
-
-    metrics = [
-        Faithfulness(llm=eval_llm),
-        AnswerRelevancy(llm=eval_llm, embeddings=eval_embeddings),
-        ContextRecall(llm=eval_llm),
-    ]
-
-    result = evaluate(dataset=dataset, metrics=metrics)
+    metrics = [faithfulness, context_recall]
+    result = evaluate(dataset=dataset, metrics=metrics, llm=eval_llm)
     return result
 
 
@@ -134,20 +116,26 @@ def main():
     print("\n" + "="*60)
     print("RAGAS 评测结果")
     print("="*60)
-    print(eval_result)
 
-    import json
-    try:
-        scores = {
-            "faithfulness": float(eval_result["faithfulness"]),
-            "answer_relevancy": float(eval_result["answer_relevancy"]),
-            "context_recall": float(eval_result["context_recall"]),
-        }
-        with open("evaluation/ragas_scores.json", "w", encoding="utf-8") as f:
-            json.dump(scores, f, ensure_ascii=False, indent=2)
-        print(f"\n评测结果已保存到 evaluation/ragas_scores.json")
-    except Exception as e:
-        print(f"保存分数时出错: {e}")
+    import numpy as np
+    faithfulness_score = float(np.nanmean(eval_result["faithfulness"]))
+    context_recall_score = float(np.nanmean(eval_result["context_recall"]))
+
+    print(f"\n  忠实度 Faithfulness：{faithfulness_score:.2f}  （建议>0.8）")
+    print(f"  上下文召回 ContextRecall：{context_recall_score:.2f}  （建议>0.7）")
+
+    if faithfulness_score < 0.8:
+        print("\n  ⚠️  忠实度偏低，建议优化Prompt，加强约束LLM只使用文档内容回答")
+    if context_recall_score >= 0.7:
+        print("\n  ✅  上下文召回表现良好，检索质量达标")
+
+    scores = {
+        "faithfulness": faithfulness_score,
+        "context_recall": context_recall_score
+    }
+    with open("evaluation/ragas_scores.json", "w", encoding="utf-8") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=2)
+    print(f"\n评测结果已保存到 evaluation/ragas_scores.json")
 
 
 if __name__ == "__main__":
